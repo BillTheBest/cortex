@@ -4,8 +4,25 @@ import (
 	"net"
 	"time"
 
+	"golang.org/x/net/context"
+
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
+	"github.com/weaveworks/common/instrument"
 )
+
+var (
+	srvRequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "cortex",
+		Name:      "srv_lookup_request_duration_seconds",
+		Help:      "Time spent looking up SRV records.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{"service", "proto", "hostname", "status_code"})
+)
+
+func init() {
+	prometheus.MustRegister(srvRequestDuration)
+}
 
 // TODO: change memcache_client to use this.
 
@@ -48,7 +65,12 @@ func (s *SRVDiscovery) loop() {
 	for {
 		select {
 		case <-ticker.C:
-			_, addrs, err := net.LookupSRV(s.Service, s.Proto, s.Hostname)
+			var addrs []*net.SRV
+			err := instrument.TimeRequestHistogram(context.Background(), "LookupSRV", srvRequestDuration, func(_ context.Context) error {
+				var err error
+				_, addrs, err = net.LookupSRV(s.Service, s.Proto, s.Hostname)
+				return err
+			})
 			if err != nil {
 				log.Warnf("Error discovering services for %s %s %s: %v", s.Service, s.Proto, s.Hostname, err)
 			}
