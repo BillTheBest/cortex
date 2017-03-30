@@ -4,11 +4,8 @@ import (
 	"net"
 	"time"
 
-	"golang.org/x/net/context"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
-	"github.com/weaveworks/common/instrument"
 )
 
 var (
@@ -66,15 +63,17 @@ func (s *SRVDiscovery) loop() {
 		select {
 		case <-ticker.C:
 			var addrs []*net.SRV
-			err := instrument.TimeRequestHistogram(context.Background(), "LookupSRV", srvRequestDuration, func(_ context.Context) error {
-				var err error
-				_, addrs, err = net.LookupSRV(s.Service, s.Proto, s.Hostname)
-				return err
-			})
+			statusCode := "200"
+			startTime := time.Now()
+			_, addrs, err := net.LookupSRV(s.Service, s.Proto, s.Hostname)
+			endTime := time.Now()
 			if err != nil {
+				statusCode = "500"
 				log.Warnf("Error discovering services for %s %s %s: %v", s.Service, s.Proto, s.Hostname, err)
+			} else {
+				s.Addresses <- addrs
 			}
-			s.Addresses <- addrs
+			srvRequestDuration.WithLabelValues(s.Service, s.Proto, s.Hostname, statusCode).Observe(endTime.Sub(startTime).Seconds())
 		case <-s.stop:
 			ticker.Stop()
 			return
