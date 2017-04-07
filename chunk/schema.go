@@ -1,14 +1,11 @@
 package chunk
 
 import (
-	"bytes"
 	"crypto/sha1"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,13 +13,6 @@ import (
 	"github.com/prometheus/common/model"
 
 	"github.com/weaveworks/cortex/util"
-)
-
-const (
-	secondsInHour      = int64(time.Hour / time.Second)
-	secondsInDay       = int64(24 * time.Hour / time.Second)
-	millisecondsInHour = int64(time.Hour / time.Millisecond)
-	millisecondsInDay  = int64(24 * time.Hour / time.Millisecond)
 )
 
 var (
@@ -108,267 +98,6 @@ func (cfg *SchemaConfig) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&cfg.V5SchemaFrom, "dynamodb.v5-schema-from", "The date (in the format YYYY-MM-DD) after which we enable v5 schema.")
 	f.Var(&cfg.V6SchemaFrom, "dynamodb.v6-schema-from", "The date (in the format YYYY-MM-DD) after which we enable v6 schema.")
 	f.Var(&cfg.V7SchemaFrom, "dynamodb.v7-schema-from", "The date (in the format YYYY-MM-DD) after which we enable v7 schema.")
-}
-
-func (cfg *SchemaConfig) tableForBucket(bucketStart int64) string {
-	if !cfg.UsePeriodicTables || bucketStart < (cfg.PeriodicTableStartAt.Unix()) {
-		return cfg.OriginalTableName
-	}
-	// TODO remove reference to time package here
-	return cfg.TablePrefix + strconv.Itoa(int(bucketStart/int64(cfg.TablePeriod/time.Second)))
-}
-
-// Bucket is a range of time with a tableName and a hashKey
-type Bucket struct {
-	from      uint32
-	through   uint32
-	tableName string
-	hashKey   string
-}
-
-func (cfg SchemaConfig) hourlyBuckets(from, through model.Time, userID string) []Bucket {
-	var (
-		fromHour    = from.Unix() / secondsInHour
-		throughHour = through.Unix() / secondsInHour
-		result      = []Bucket{}
-	)
-
-	for i := fromHour; i <= throughHour; i++ {
-		relativeFrom := util.Max64(0, int64(from)-(i*millisecondsInHour))
-		relativeThrough := util.Min64(millisecondsInHour, int64(through)-(i*millisecondsInDay))
-		result = append(result, Bucket{
-			from:      uint32(relativeFrom),
-			through:   uint32(relativeThrough),
-			tableName: cfg.tableForBucket(i * secondsInHour),
-			hashKey:   fmt.Sprintf("%s:%d", userID, i),
-		})
-	}
-	return result
-}
-
-func (cfg SchemaConfig) dailyBuckets(from, through model.Time, userID string) []Bucket {
-	var (
-		fromDay    = from.Unix() / secondsInDay
-		throughDay = through.Unix() / secondsInDay
-		result     = []Bucket{}
-	)
-
-	for i := fromDay; i <= throughDay; i++ {
-		// The idea here is that the hash key contains the bucket start time (rounded to
-		// the nearest day).  The range key can contain the offset from that, to the
-		// (start/end) of the chunk. For chunks that span multiple buckets, these
-		// offsets will be capped to the bucket boundaries, i.e. start will be
-		// positive in the first bucket, then zero in the next etc.
-		//
-		// The reason for doing all this is to reduce the size of the time stamps we
-		// include in the range keys - we use a uint32 - as we then have to base 32
-		// encode it.
-
-		relativeFrom := util.Max64(0, int64(from)-(i*millisecondsInDay))
-		relativeThrough := util.Min64(millisecondsInDay, int64(through)-(i*millisecondsInDay))
-		result = append(result, Bucket{
-			from:      uint32(relativeFrom),
-			through:   uint32(relativeThrough),
-			tableName: cfg.tableForBucket(i * secondsInDay),
-			hashKey:   fmt.Sprintf("%s:d%d", userID, i),
-		})
-	}
-	return result
-}
-
-// compositeSchema is a Schema which delegates to various schemas depending
-// on when they were activated.
-type compositeSchema struct {
-	schemas []compositeSchemaEntry
-}
-
-type compositeSchemaEntry struct {
-	start model.Time
-	Schema
-}
-
-type byStart []compositeSchemaEntry
-
-func (a byStart) Len() int           { return len(a) }
-func (a byStart) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byStart) Less(i, j int) bool { return a[i].start < a[j].start }
-
-func newCompositeSchema(cfg SchemaConfig) (Schema, error) {
-	schemas := []compositeSchemaEntry{
-		{0, v1Schema(cfg)},
-	}
-
-	if cfg.DailyBucketsFrom.IsSet() {
-		schemas = append(schemas, compositeSchemaEntry{cfg.DailyBucketsFrom.Time, v2Schema(cfg)})
-	}
-
-	if cfg.Base64ValuesFrom.IsSet() {
-		schemas = append(schemas, compositeSchemaEntry{cfg.Base64ValuesFrom.Time, v3Schema(cfg)})
-	}
-
-	if cfg.V4SchemaFrom.IsSet() {
-		schemas = append(schemas, compositeSchemaEntry{cfg.V4SchemaFrom.Time, v4Schema(cfg)})
-	}
-
-	if cfg.V5SchemaFrom.IsSet() {
-		schemas = append(schemas, compositeSchemaEntry{cfg.V5SchemaFrom.Time, v5Schema(cfg)})
-	}
-
-	if cfg.V6SchemaFrom.IsSet() {
-		schemas = append(schemas, compositeSchemaEntry{cfg.V6SchemaFrom.Time, v6Schema(cfg)})
-	}
-
-	if cfg.V7SchemaFrom.IsSet() {
-		schemas = append(schemas, compositeSchemaEntry{cfg.V7SchemaFrom.Time, v7Schema(cfg)})
-	}
-
-	if !sort.IsSorted(byStart(schemas)) {
-		return nil, fmt.Errorf("schemas not in time-sorted order")
-	}
-
-	return compositeSchema{schemas}, nil
-}
-
-func (c compositeSchema) forSchemasIndexQuery(from, through model.Time, callback func(from, through model.Time, schema Schema) ([]IndexQuery, error)) ([]IndexQuery, error) {
-	if len(c.schemas) == 0 {
-		return nil, nil
-	}
-
-	// first, find the schema with the highest start _before or at_ from
-	i := sort.Search(len(c.schemas), func(i int) bool {
-		return c.schemas[i].start > from
-	})
-	if i > 0 {
-		i--
-	} else {
-		// This could happen if we get passed a sample from before 1970.
-		i = 0
-		from = c.schemas[0].start
-	}
-
-	// next, find the schema with the lowest start _after_ through
-	j := sort.Search(len(c.schemas), func(j int) bool {
-		return c.schemas[j].start > through
-	})
-
-	min := func(a, b model.Time) model.Time {
-		if a < b {
-			return a
-		}
-		return b
-	}
-
-	start := from
-	result := []IndexQuery{}
-	for ; i < j; i++ {
-		nextSchemaStarts := model.Latest
-		if i+1 < len(c.schemas) {
-			nextSchemaStarts = c.schemas[i+1].start
-		}
-
-		// If the next schema starts at the same time as this one,
-		// skip this one.
-		if nextSchemaStarts == c.schemas[i].start {
-			continue
-		}
-
-		end := min(through, nextSchemaStarts-1)
-		entries, err := callback(start, end, c.schemas[i].Schema)
-		if err != nil {
-			return nil, err
-		}
-
-		result = append(result, entries...)
-		start = nextSchemaStarts
-	}
-
-	return result, nil
-}
-
-func (c compositeSchema) forSchemasIndexEntry(from, through model.Time, callback func(from, through model.Time, schema Schema) ([]IndexEntry, error)) ([]IndexEntry, error) {
-	if len(c.schemas) == 0 {
-		return nil, nil
-	}
-
-	// first, find the schema with the highest start _before or at_ from
-	i := sort.Search(len(c.schemas), func(i int) bool {
-		return c.schemas[i].start > from
-	})
-	if i > 0 {
-		i--
-	} else {
-		// This could happen if we get passed a sample from before 1970.
-		i = 0
-		from = c.schemas[0].start
-	}
-
-	// next, find the schema with the lowest start _after_ through
-	j := sort.Search(len(c.schemas), func(j int) bool {
-		return c.schemas[j].start > through
-	})
-
-	min := func(a, b model.Time) model.Time {
-		if a < b {
-			return a
-		}
-		return b
-	}
-
-	start := from
-	result := []IndexEntry{}
-	for ; i < j; i++ {
-		nextSchemaStarts := model.Latest
-		if i+1 < len(c.schemas) {
-			nextSchemaStarts = c.schemas[i+1].start
-		}
-
-		// If the next schema starts at the same time as this one,
-		// skip this one.
-		if nextSchemaStarts == c.schemas[i].start {
-			continue
-		}
-
-		end := min(through, nextSchemaStarts-1)
-		entries, err := callback(start, end, c.schemas[i].Schema)
-		if err != nil {
-			return nil, err
-		}
-
-		result = append(result, entries...)
-		start = nextSchemaStarts
-	}
-
-	return result, nil
-}
-
-func (c compositeSchema) GetWriteEntries(from, through model.Time, userID string, metricName model.LabelValue, labels model.Metric, chunkID string) ([]IndexEntry, error) {
-	return c.forSchemasIndexEntry(from, through, func(from, through model.Time, schema Schema) ([]IndexEntry, error) {
-		return schema.GetWriteEntries(from, through, userID, metricName, labels, chunkID)
-	})
-}
-
-func (c compositeSchema) GetReadQueries(from, through model.Time, userID string) ([]IndexQuery, error) {
-	return c.forSchemasIndexQuery(from, through, func(from, through model.Time, schema Schema) ([]IndexQuery, error) {
-		return schema.GetReadQueries(from, through, userID)
-	})
-}
-
-func (c compositeSchema) GetReadQueriesForMetric(from, through model.Time, userID string, metricName model.LabelValue) ([]IndexQuery, error) {
-	return c.forSchemasIndexQuery(from, through, func(from, through model.Time, schema Schema) ([]IndexQuery, error) {
-		return schema.GetReadQueriesForMetric(from, through, userID, metricName)
-	})
-}
-
-func (c compositeSchema) GetReadQueriesForMetricLabel(from, through model.Time, userID string, metricName model.LabelValue, labelName model.LabelName) ([]IndexQuery, error) {
-	return c.forSchemasIndexQuery(from, through, func(from, through model.Time, schema Schema) ([]IndexQuery, error) {
-		return schema.GetReadQueriesForMetricLabel(from, through, userID, metricName, labelName)
-	})
-}
-
-func (c compositeSchema) GetReadQueriesForMetricLabelValue(from, through model.Time, userID string, metricName model.LabelValue, labelName model.LabelName, labelValue model.LabelValue) ([]IndexQuery, error) {
-	return c.forSchemasIndexQuery(from, through, func(from, through model.Time, schema Schema) ([]IndexQuery, error) {
-		return schema.GetReadQueriesForMetricLabelValue(from, through, userID, metricName, labelName, labelValue)
-	})
 }
 
 // v1Schema was:
@@ -879,86 +608,75 @@ func (v7Entries) GetReadQueries(from, _ uint32, tableName, bucketHashKey string)
 	}, nil
 }
 
-func buildRangeKey(ss ...[]byte) []byte {
-	length := 0
-	for _, s := range ss {
-		length += len(s) + 1
+const (
+	secondsInHour      = int64(time.Hour / time.Second)
+	secondsInDay       = int64(24 * time.Hour / time.Second)
+	millisecondsInHour = int64(time.Hour / time.Millisecond)
+	millisecondsInDay  = int64(24 * time.Hour / time.Millisecond)
+)
+
+func (cfg *SchemaConfig) tableForBucket(bucketStart int64) string {
+	if !cfg.UsePeriodicTables || bucketStart < (cfg.PeriodicTableStartAt.Unix()) {
+		return cfg.OriginalTableName
 	}
-	output, i := make([]byte, length, length), 0
-	for _, s := range ss {
-		copy(output[i:i+len(s)], s)
-		i += len(s) + 1
-	}
-	return output
+	// TODO remove reference to time package here
+	return cfg.TablePrefix + strconv.Itoa(int(bucketStart/int64(cfg.TablePeriod/time.Second)))
 }
 
-func encodeBase64Value(value model.LabelValue) []byte {
-	encodedLen := base64.RawStdEncoding.EncodedLen(len(value))
-	encoded := make([]byte, encodedLen, encodedLen)
-	base64.RawStdEncoding.Encode(encoded, []byte(value))
-	return encoded
+// Bucket is a range of time with a tableName and a hashKey
+type Bucket struct {
+	from      uint32
+	through   uint32
+	tableName string
+	hashKey   string
 }
 
-func decodeBase64Value(bs []byte) (model.LabelValue, error) {
-	decodedLen := base64.RawStdEncoding.DecodedLen(len(bs))
-	decoded := make([]byte, decodedLen, decodedLen)
-	if _, err := base64.RawStdEncoding.Decode(decoded, bs); err != nil {
-		return "", err
+func (cfg SchemaConfig) hourlyBuckets(from, through model.Time, userID string) []Bucket {
+	var (
+		fromHour    = from.Unix() / secondsInHour
+		throughHour = through.Unix() / secondsInHour
+		result      = []Bucket{}
+	)
+
+	for i := fromHour; i <= throughHour; i++ {
+		relativeFrom := util.Max64(0, int64(from)-(i*millisecondsInHour))
+		relativeThrough := util.Min64(millisecondsInHour, int64(through)-(i*millisecondsInDay))
+		result = append(result, Bucket{
+			from:      uint32(relativeFrom),
+			through:   uint32(relativeThrough),
+			tableName: cfg.tableForBucket(i * secondsInHour),
+			hashKey:   fmt.Sprintf("%s:%d", userID, i),
+		})
 	}
-	return model.LabelValue(decoded), nil
+	return result
 }
 
-func parseRangeValue(rangeValue []byte, value []byte) (string, model.LabelValue, bool, error) {
-	components := make([][]byte, 0, 5)
-	i, j := 0, 0
-	for j < len(rangeValue) {
-		if rangeValue[j] != 0 {
-			j++
-			continue
-		}
+func (cfg SchemaConfig) dailyBuckets(from, through model.Time, userID string) []Bucket {
+	var (
+		fromDay    = from.Unix() / secondsInDay
+		throughDay = through.Unix() / secondsInDay
+		result     = []Bucket{}
+	)
 
-		components = append(components, rangeValue[i:j])
-		j++
-		i = j
+	for i := fromDay; i <= throughDay; i++ {
+		// The idea here is that the hash key contains the bucket start time (rounded to
+		// the nearest day).  The range key can contain the offset from that, to the
+		// (start/end) of the chunk. For chunks that span multiple buckets, these
+		// offsets will be capped to the bucket boundaries, i.e. start will be
+		// positive in the first bucket, then zero in the next etc.
+		//
+		// The reason for doing all this is to reduce the size of the time stamps we
+		// include in the range keys - we use a uint32 - as we then have to base 32
+		// encode it.
+
+		relativeFrom := util.Max64(0, int64(from)-(i*millisecondsInDay))
+		relativeThrough := util.Min64(millisecondsInDay, int64(through)-(i*millisecondsInDay))
+		result = append(result, Bucket{
+			from:      uint32(relativeFrom),
+			through:   uint32(relativeThrough),
+			tableName: cfg.tableForBucket(i * secondsInDay),
+			hashKey:   fmt.Sprintf("%s:d%d", userID, i),
+		})
 	}
-
-	switch {
-	case len(components) < 3:
-		return "", "", false, fmt.Errorf("invalid range value: %x", rangeValue)
-
-	// v1 & v2 schema had three components - label name, label value and chunk ID.
-	// No version number.
-	case len(components) == 3:
-		return string(components[2]), model.LabelValue(components[1]), true, nil
-
-	// v3 schema had four components - label name, label value, chunk ID and version.
-	// "version" is 1 and label value is base64 encoded.
-	case bytes.Equal(components[3], rangeKeyV1):
-		labelValue, err := decodeBase64Value(components[1])
-		return string(components[2]), labelValue, false, err
-
-	// v4 schema wrote v3 range keys and a new range key - version 2,
-	// with four components - <empty>, <empty>, chunk ID and version.
-	case bytes.Equal(components[3], rangeKeyV2):
-		return string(components[2]), model.LabelValue(""), false, nil
-
-	// v5 schema version 3 range key is chunk end time, <empty>, chunk ID, version
-	case bytes.Equal(components[3], rangeKeyV3):
-		return string(components[2]), model.LabelValue(""), false, nil
-
-	// v5 schema version 4 range key is chunk end time, label value, chunk ID, version
-	case bytes.Equal(components[3], rangeKeyV4):
-		labelValue, err := decodeBase64Value(components[1])
-		return string(components[2]), labelValue, false, err
-
-	// v6 schema added version 5 range keys, which have the label value written in
-	// to the value, not the range key. So they are [chunk end time, <empty>, chunk ID, version].
-	case bytes.Equal(components[3], rangeKeyV5):
-		labelValue := model.LabelValue(value)
-		return string(components[2]), labelValue, false, nil
-
-	default:
-		return "", model.LabelValue(""), false, fmt.Errorf("unrecognised version: '%v'", string(components[3]))
-	}
-
+	return result
 }
