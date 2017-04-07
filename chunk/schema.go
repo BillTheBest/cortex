@@ -623,7 +623,7 @@ func (cfg *SchemaConfig) tableForBucket(bucketStart int64) string {
 	return cfg.TablePrefix + strconv.Itoa(int(bucketStart/int64(cfg.TablePeriod/time.Second)))
 }
 
-// Bucket is a range of time with a tableName and a hashKey
+// Bucket desribes a range of time with a tableName and hashKey
 type Bucket struct {
 	from      uint32
 	through   uint32
