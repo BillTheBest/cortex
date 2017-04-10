@@ -5,9 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/prometheus/common/model"
 
@@ -567,77 +565,4 @@ func (v7Entries) GetReadQueries(from, _ uint32, tableName, bucketHashKey string)
 			HashValue: bucketHashKey,
 		},
 	}, nil
-}
-
-const (
-	secondsInHour      = int64(time.Hour / time.Second)
-	secondsInDay       = int64(24 * time.Hour / time.Second)
-	millisecondsInHour = int64(time.Hour / time.Millisecond)
-	millisecondsInDay  = int64(24 * time.Hour / time.Millisecond)
-)
-
-func (cfg *SchemaConfig) tableForBucket(bucketStart int64) string {
-	if !cfg.UsePeriodicTables || bucketStart < (cfg.PeriodicTableStartAt.Unix()) {
-		return cfg.OriginalTableName
-	}
-	// TODO remove reference to time package here
-	return cfg.TablePrefix + strconv.Itoa(int(bucketStart/int64(cfg.TablePeriod/time.Second)))
-}
-
-// Bucket desribes a range of time with a tableName and hashKey
-type Bucket struct {
-	from      uint32
-	through   uint32
-	tableName string
-	hashKey   string
-}
-
-func (cfg SchemaConfig) hourlyBuckets(from, through model.Time, userID string) []Bucket {
-	var (
-		fromHour    = from.Unix() / secondsInHour
-		throughHour = through.Unix() / secondsInHour
-		result      = []Bucket{}
-	)
-
-	for i := fromHour; i <= throughHour; i++ {
-		relativeFrom := util.Max64(0, int64(from)-(i*millisecondsInHour))
-		relativeThrough := util.Min64(millisecondsInHour, int64(through)-(i*millisecondsInDay))
-		result = append(result, Bucket{
-			from:      uint32(relativeFrom),
-			through:   uint32(relativeThrough),
-			tableName: cfg.tableForBucket(i * secondsInHour),
-			hashKey:   fmt.Sprintf("%s:%d", userID, i),
-		})
-	}
-	return result
-}
-
-func (cfg SchemaConfig) dailyBuckets(from, through model.Time, userID string) []Bucket {
-	var (
-		fromDay    = from.Unix() / secondsInDay
-		throughDay = through.Unix() / secondsInDay
-		result     = []Bucket{}
-	)
-
-	for i := fromDay; i <= throughDay; i++ {
-		// The idea here is that the hash key contains the bucket start time (rounded to
-		// the nearest day).  The range key can contain the offset from that, to the
-		// (start/end) of the chunk. For chunks that span multiple buckets, these
-		// offsets will be capped to the bucket boundaries, i.e. start will be
-		// positive in the first bucket, then zero in the next etc.
-		//
-		// The reason for doing all this is to reduce the size of the time stamps we
-		// include in the range keys - we use a uint32 - as we then have to base 32
-		// encode it.
-
-		relativeFrom := util.Max64(0, int64(from)-(i*millisecondsInDay))
-		relativeThrough := util.Min64(millisecondsInDay, int64(through)-(i*millisecondsInDay))
-		result = append(result, Bucket{
-			from:      uint32(relativeFrom),
-			through:   uint32(relativeThrough),
-			tableName: cfg.tableForBucket(i * secondsInDay),
-			hashKey:   fmt.Sprintf("%s:d%d", userID, i),
-		})
-	}
-	return result
 }
