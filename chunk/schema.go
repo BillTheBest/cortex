@@ -4,7 +4,6 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
-	"flag"
 	"fmt"
 	"strconv"
 	"strings"
@@ -60,44 +59,6 @@ type IndexEntry struct {
 
 	// New for v6 schema, label value is not written as part of the range key.
 	Value []byte
-}
-
-// SchemaConfig contains the config for our chunk index schemas
-type SchemaConfig struct {
-	PeriodicTableConfig
-	OriginalTableName string
-
-	// After midnight on this day, we start bucketing indexes by day instead of by
-	// hour.  Only the day matters, not the time within the day.
-	DailyBucketsFrom util.DayValue
-
-	// After this time, we will only query for base64-encoded label values.
-	Base64ValuesFrom util.DayValue
-
-	// After this time, we will read and write v4 schemas.
-	V4SchemaFrom util.DayValue
-
-	// After this time, we will read and write v5 schemas.
-	V5SchemaFrom util.DayValue
-
-	// After this time, we will read and write v6 schemas.
-	V6SchemaFrom util.DayValue
-
-	// After this time, we will read and write v7 schemas.
-	V7SchemaFrom util.DayValue
-}
-
-// RegisterFlags adds the flags required to config this to the given FlagSet
-func (cfg *SchemaConfig) RegisterFlags(f *flag.FlagSet) {
-	cfg.PeriodicTableConfig.RegisterFlags(f)
-
-	flag.StringVar(&cfg.OriginalTableName, "dynamodb.original-table-name", "", "The name of the DynamoDB table used before versioned schemas were introduced.")
-	f.Var(&cfg.DailyBucketsFrom, "dynamodb.daily-buckets-from", "The date (in the format YYYY-MM-DD) of the first day for which DynamoDB index buckets should be day-sized vs. hour-sized.")
-	f.Var(&cfg.Base64ValuesFrom, "dynamodb.base64-buckets-from", "The date (in the format YYYY-MM-DD) after which we will stop querying to non-base64 encoded values.")
-	f.Var(&cfg.V4SchemaFrom, "dynamodb.v4-schema-from", "The date (in the format YYYY-MM-DD) after which we enable v4 schema.")
-	f.Var(&cfg.V5SchemaFrom, "dynamodb.v5-schema-from", "The date (in the format YYYY-MM-DD) after which we enable v5 schema.")
-	f.Var(&cfg.V6SchemaFrom, "dynamodb.v6-schema-from", "The date (in the format YYYY-MM-DD) after which we enable v6 schema.")
-	f.Var(&cfg.V7SchemaFrom, "dynamodb.v7-schema-from", "The date (in the format YYYY-MM-DD) after which we enable v7 schema.")
 }
 
 // v1Schema was:
