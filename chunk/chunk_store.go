@@ -378,7 +378,6 @@ func (c *Store) lookupChunksByMetricName(ctx context.Context, from, through mode
 }
 
 func (c *Store) lookupEntriesByQueries(ctx context.Context, queries []IndexQuery) ([]IndexEntry, error) {
-	// Call lookupEntriesByQuery for each query
 	incomingEntries := make(chan []IndexEntry)
 	incomingErrors := make(chan error)
 	for _, query := range queries {
@@ -462,7 +461,10 @@ func (c *Store) convertIndexEntriesToChunks(ctx context.Context, entries []Index
 		}
 		chunkSet = append(chunkSet, chunk)
 	}
-	return chunkSet, nil
+
+	// Return chunks sorted and deduped because they will be merged with other sets
+	sort.Sort(chunkSet)
+	return unique(chunkSet), nil
 }
 
 func (c *Store) fetchChunkData(ctx context.Context, chunkSet []Chunk) ([]Chunk, error) {
